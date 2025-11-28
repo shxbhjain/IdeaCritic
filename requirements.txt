@@ -1,0 +1,23 @@
+# --- Core ---
+streamlit==1.39.0
+python-dotenv==1.0.1
+
+# --- LangChain (keep these in sync) ---
+langchain==0.2.16
+langchain-core==0.2.16
+langchain-community==0.2.16
+
+# --- Google Gemini (tested together) ---
+langchain-google-genai==1.0.6
+google-generativeai==0.8.3
+protobuf==4.25.3
+
+# --- Storage ---
+pymongo==4.8.0
+
+# --- RAG (disabled on Windows) ---
+# faiss-cpu  # omit on Windows / Py3.13
+# sentence-transformers  # omit unless you actually use it
+
+# --- Local LLM (optional) ---
+llama-cpp-python==0.2.90
