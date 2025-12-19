@@ -1,26 +1,37 @@
+
+
 import streamlit as st
 import os
 import datetime
+import re
 from dotenv import load_dotenv
 from pymongo import MongoClient, DESCENDING
 from pymongo.server_api import ServerApi
-import re
 
 # LangChain imports
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain_core.prompts import PromptTemplate
 
-# --- Page Configuration ---
+# RAG imports
+try:
+    from rag_store import get_rag_store, get_marketplace_context
+    HAS_RAG = True
+except ImportError:
+    HAS_RAG = False
+# --------------------------------------------------
+# Page Configuration
+# --------------------------------------------------
 st.set_page_config(
     page_title="IdeaCritic (LangChain)",
     page_icon="🚀",
     layout="wide"
 )
 
-# --- Configurations and Initializations ---
 load_dotenv()
 
+# --------------------------------------------------
+# LLM & DB Setup
+# --------------------------------------------------
 @st.cache_resource
 def get_llm():
     google_api_key = os.getenv("GOOGLE_API_KEY")
@@ -28,251 +39,409 @@ def get_llm():
         st.error("GOOGLE_API_KEY not found in .env file. Please add it.")
         st.stop()
     try:
-        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", api_key=google_api_key, streaming=True)
+        # return ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", api_key=google_api_key, streaming=True)
+        return ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, streaming=True)
     except Exception as e:
         st.error(f"❌ Failed to configure Google AI: {e}")
         st.stop()
 
+
 @st.cache_resource
 def get_mongo_connection():
-    connection_string = os.getenv("MONGO_CONNECTION_STRING")
-    if not connection_string:
-        st.error("MONGO_CONNECTION_STRING not found in .env file.")
+    uri = os.getenv("MONGO_CONNECTION_STRING")
+    if not uri:
+        st.error("MONGO_CONNECTION_STRING missing in .env")
         st.stop()
-    try:
-        mongo_client = MongoClient(connection_string, server_api=ServerApi('1'))
-        mongo_client.admin.command('ping')
-        return mongo_client
-    except Exception as e:
-        st.error(f"❌ Connection to MongoDB failed: {e}")
-        st.stop()
+
+    client = MongoClient(uri, server_api=ServerApi("1"))
+    client.admin.command("ping")
+    return client
+
 
 llm = get_llm()
 mongo_client = get_mongo_connection()
-db = mongo_client['ideacritic_db']
-debates_collection = db['debates']
 
-# --- Prompt Templates ---
+db = mongo_client["ideacritic_db"]
+debates_collection = db["debates"]
+
+# --------------------------------------------------
+# RAG Setup
+# --------------------------------------------------
+@st.cache_resource
+def get_rag_context():
+    """Get RAG store for retrieving relevant past analyses."""
+    if not HAS_RAG:
+        return None
+    try:
+        return get_rag_store()
+    except Exception:
+        return None
+
+def initialize_marketplace_data():
+    """Initialize the RAG store with sample marketplace data."""
+    if not HAS_RAG:
+        return
+    
+    try:
+        from rag_store import add_marketplace_data
+        
+        # Sample marketplace data - in real implementation, this would come from APIs
+        sample_marketplace_data = [
+            {
+                "text": "Fitness tracking apps dominate the market with over 500M downloads. Top apps include MyFitnessPal, Strava, and Nike Training Club. Average revenue per user: $2.50/month. Key features: workout tracking, social challenges, personalized plans.",
+                "source": "App Store Analytics",
+                "category": "Health  & Fitness",
+                "metadata": {"downloads": "500M+", "avg_revenue": "$2.50/user/month"}
+            },
+            {
+                "text": "AI-powered educational apps growing 300% YoY. Duolingo leads with 500M users. Market size: $2.2B. Key success factors: gamification, personalized learning paths, offline access.",
+                "source": "Google Play Store",
+                "category": "Education",
+                "metadata": {"growth": "300%", "market_size": "$2.2B"}
+            },
+            {
+                "text": "Mental health apps market projected to reach $6.2B by 2027. Headspace and Calm dominate with subscription models. Average price: $4.99/month. Focus on mindfulness, CBT, sleep tracking.",
+                "source": "Market Research Report",
+                "category": "Health & Wellness",
+                "metadata": {"projection": "$6.2B by 2027", "avg_price": "$4.99/month"}
+            },
+            {
+                "text": "SaaS productivity tools market: $50B+. Slack, Notion, Trello lead. Freemium model successful. Key features: collaboration, automation, integrations. Customer acquisition cost: $150-300.",
+                "source": "Industry Report",
+                "category": "Productivity",
+                "metadata": {"market_size": "$50B+", "cac": "$150-300"}
+            }
+        ]
+        
+        success = add_marketplace_data(sample_marketplace_data)
+        if success:
+            st.success("📊 Marketplace data loaded into RAG system!")
+        else:
+            st.warning("⚠️ Could not load marketplace data")
+            
+    except Exception as e:
+        st.warning(f"⚠️ Marketplace data loading failed: {e}")
+
+# Initialize marketplace data on app start
+if HAS_RAG and 'marketplace_initialized' not in st.session_state:
+    initialize_marketplace_data()
+    st.session_state.marketplace_initialized = True
+
+def retrieve_relevant_context(query: str, top_k: int = 3) -> str:
+    """Retrieve relevant context from past analyses and marketplace data."""
+    context_parts = []
+    
+    # Get past analysis context
+    try:
+        store = get_rag_store()
+        if store:
+            analysis_results = store.search(query, top_k=top_k)
+            if analysis_results:
+                analysis_context = "\n\n--- Relevant Past Analyses ---\n"
+                for i, result in enumerate(analysis_results, 1):
+                    analysis_context += f"{i}. {result.get('text', 'No text available')}\n"
+                    if 'idea_title' in result:
+                        analysis_context += f"   Idea: {result['idea_title']}\n"
+                    analysis_context += "\n"
+                context_parts.append(analysis_context)
+    except Exception:
+        pass
+    
+    # Get marketplace context
+    marketplace_context = get_marketplace_context(query, top_k=2)
+    if marketplace_context:
+        context_parts.append(marketplace_context)
+    
+    return "".join(context_parts)
+
+# --------------------------------------------------
+# Prompt Templates
+# --------------------------------------------------
 clarify_prompt = PromptTemplate(
     input_variables=["title", "desc"],
     template="""
-    You are a startup mentor. A founder provided this idea:
-    Title: {title}
-    Description: {desc}
+You are a startup mentor.
 
-    Generate exactly 3–5 clarifying questions to better understand this idea.
-    - Output format must be strictly a numbered list like:
-      1. <question>
-      2. <question>
-      ...
-    - Keep questions short, clear, and specific.
-    - Focus on market, target audience, feasibility, uniqueness, and execution.
-    """
+Title: {title}
+Description: {desc}
+
+Generate exactly 3–5 clarifying questions.
+
+Rules:
+- Output strictly as numbered list
+- Short, precise, no fluff
+"""
 )
 
 optimist_prompt = PromptTemplate(
-    input_variables=["idea", "transcript"],
+    input_variables=["idea", "transcript", "context"],
     template="""
-    You are a startup Optimist. The startup idea is: "{idea}".
+You are a startup Optimist. Use the relevant past analyses to inform your response.
 
-    Debate so far:
-    {transcript}
+Idea:
+{idea}
 
-    Now respond with exactly 3 concise bullet points.
-    - Defend against the Critic’s previous objections where possible.
-    - Highlight new strengths and opportunities.
-    - Keep the points short, sharp, and positive.
-    """
+Relevant Past Analyses:
+{context}
+
+Transcript so far:
+{transcript}
+
+Respond with exactly 3 bullet points defending the idea, learning from past successful analyses.
+"""
 )
 
 critic_prompt = PromptTemplate(
-    input_variables=["idea", "transcript"],
+    input_variables=["idea", "transcript", "context"],
     template="""
-    You are a startup Critic. The startup idea is: "{idea}".
+You are a startup Critic. Use the relevant past analyses to inform your response.
 
-    Debate so far:
-    {transcript}
+Idea:
+{idea}
 
-    The Optimist has just spoken. Now respond point-by-point:
-    - Mirror each Optimist bullet point with a Critic counterpoint.
-    - Keep the order aligned (1 vs 1, 2 vs 2, etc).
-    - Use short and sharp sentences that directly challenge optimism.
-    """
+Relevant Past Analyses:
+{context}
+
+Transcript so far:
+{transcript}
+
+Counter the Optimist point-by-point (same order), drawing from past critical insights.
+"""
 )
 
 summary_prompt = PromptTemplate(
-    input_variables=["idea", "transcript"],
+    input_variables=["idea", "transcript", "context"],
     template="""
-    You are an expert Business Analyst. You have a discussion transcript for the startup idea "{idea}".
+You are a Business Analyst. Use relevant past analyses for context.
 
-    Discussion Transcript:
-    ---
-    {transcript}
-    ---
+Idea:
+{idea}
 
-    Write a final actionable summary:
-    - First, a short paragraph with your verdict.
-    - Then 3 key bullet points.
-    """
+Relevant Past Analyses:
+{context}
+
+Transcript:
+{transcript}
+
+Give:
+- One verdict paragraph (considering past patterns)
+- 3 actionable bullet points
+"""
 )
 
-# --- Chains ---
-clarify_chain = LLMChain(llm=llm, prompt=clarify_prompt)
-optimist_chain = LLMChain(llm=llm, prompt=optimist_prompt)
-critic_chain = LLMChain(llm=llm, prompt=critic_prompt)
-summary_chain = LLMChain(llm=llm, prompt=summary_prompt)
+# --------------------------------------------------
+# Chains (LCEL)
+# --------------------------------------------------
+clarify_chain = clarify_prompt | llm
+optimist_chain = optimist_prompt | llm
+critic_chain = critic_prompt | llm
+summary_chain = summary_prompt | llm
 
-# --- Core Functions ---
+# --------------------------------------------------
+# Helpers (CRITICAL FIX)
+# --------------------------------------------------
+def extract_text(response):
+    return response.content if hasattr(response, "content") else str(response)
+
+
 @st.cache_data
 def generate_clarifying_questions(title, desc):
-    raw_text = clarify_chain.run({"title": title, "desc": desc})
-    questions = [q.strip() for q in raw_text.split("\n") if re.match(r'^\d+\.', q.strip())]
-    return questions if questions else [raw_text]
+    resp = clarify_chain.invoke({"title": title, "desc": desc})
+    text = extract_text(resp)
 
-def get_agent_response(chain, idea, transcript):
-    return chain.run({"idea": idea, "transcript": transcript})
+    questions = [
+        q.strip() for q in text.split("\n")
+        if re.match(r"^\d+\.", q.strip())
+    ]
+    return questions if questions else [text]
 
-def get_summary(idea, transcript):
-    return summary_chain.run({"idea": idea, "transcript": transcript})
 
-# --- Page 1: New Analysis Page ---
+def agent_response(chain, idea, transcript, context=""):
+    resp = chain.invoke({"idea": idea, "transcript": transcript, "context": context})
+    return extract_text(resp)
+
+
+def get_summary(idea, transcript, context=""):
+    resp = summary_chain.invoke({"idea": idea, "transcript": transcript, "context": context})
+    return extract_text(resp)
+
+# --------------------------------------------------
+#  Page: New Analysis
+# --------------------------------------------------
 def show_new_analysis_page():
-    st.title("🚀 New Idea Analysis (LangChain)")
+    # Modern header
+    st.title("🚀 IdeaCritic - AI Startup Analysis")
+    st.markdown("***Transform your startup idea into a data-driven opportunity with AI-powered market intelligence***")
 
     if "clarifying_questions" not in st.session_state:
-        st.header("Step 1: Describe your startup idea")
-        startup_idea_title = st.text_input("Enter a short title", placeholder="e.g., AI-powered fitness coach")
-        startup_idea_desc = st.text_area("Describe your startup idea", height=150)
+        title = st.text_input("Startup Title")
+        desc = st.text_area("Describe your idea", height=150)
 
         if st.button("Proceed", type="primary"):
-            if startup_idea_title and startup_idea_desc:
-                with st.spinner("Generating clarifying questions..."):
-                    st.session_state["clarifying_questions"] = generate_clarifying_questions(startup_idea_title, startup_idea_desc)
-                st.session_state["idea_title"] = startup_idea_title
-                st.session_state["idea_desc"] = startup_idea_desc
-                st.session_state["answers"] = {}
-                st.rerun()
-            else:
-                st.error("Please enter both title and description.")
-    else:
-        st.header("Step 2: Answer the clarifying questions")
-        for i, q in enumerate(st.session_state["clarifying_questions"], start=1):
-            q_cleaned = re.sub(r'^\d+\.\s*', '', q)
-            st.session_state["answers"][f"Q{i}"] = st.text_area(f"**{q_cleaned}**", key=f"q{i}")
+            if not title or not desc:
+                st.error("Title and description required.")
+                return
 
-        st.divider()
-        st.header("Step 3: Start the analysis")
-        num_rounds = st.slider("How many rounds should the discussion be?", 1, 5, 3)
+            with st.spinner("Generating questions..."):
+                st.session_state.clarifying_questions = generate_clarifying_questions(title, desc)
+                st.session_state.idea_title = title
+                st.session_state.idea_desc = desc
+                st.session_state.answers = {}
+            st.rerun()
+
+    else:
+        st.header("Answer Clarifying Questions")
+
+        for i, q in enumerate(st.session_state.clarifying_questions, 1):
+            clean = re.sub(r"^\d+\.\s*", "", q)
+            st.session_state.answers[f"Q{i}"] = st.text_area(clean, key=f"q{i}")
+
+        rounds = st.slider("Discussion rounds", 1, 5, 3)
 
         if st.button("Start Analysis", type="primary"):
-            idea_full_context = st.session_state["idea_desc"] + "\n\n---Clarifying Details---\n"
-            for i, q in enumerate(st.session_state["clarifying_questions"], start=1):
-                q_cleaned = re.sub(r'^\d+\.\s*', '', q)
-                idea_full_context += f"Q: {q_cleaned}\nA: {st.session_state['answers'].get(f'Q{i}', 'Not answered.')}\n"
+            idea_context = st.session_state.idea_desc + "\n\n"
+            for i, q in enumerate(st.session_state.clarifying_questions, 1):
+                idea_context += f"{q}\nA: {st.session_state.answers.get(f'Q{i}', '')}\n"
+
+            # Retrieve relevant RAG context
+            rag_context = retrieve_relevant_context(
+                f"{st.session_state.idea_title} {st.session_state.idea_desc}", 
+                top_k=3
+            )
+            
+            if rag_context:
+                # Check if marketplace data is included
+                has_marketplace = "[MARKETPLACE]" in rag_context or "--- Marketplace Intelligence ---" in rag_context
+                has_analysis = "--- Relevant Past Analyses ---" in rag_context
+                
+                status_parts = []
+                if has_analysis:
+                    status_parts.append("past analyses")
+                if has_marketplace:
+                    status_parts.append("marketplace data")
+                
+                if status_parts:
+                    st.info(f"🧠 RAG activated: Using insights from {', '.join(status_parts)}")
+                else:
+                    st.info("🧠 RAG activated: Using historical data")
+            else:
+                st.warning("📚 No relevant data found in RAG store")
 
             transcript = ""
+            st.subheader("💬 Debate")
 
-            st.subheader("💬 Live Discussion Transcript")
-            for i in range(num_rounds):
-                round_number = i + 1
-                with st.container():
-                    st.markdown(f"#### Round {round_number}")
-                    
-                    st.markdown("Optimist's Turn:")
-                    with st.spinner("Optimist is thinking..."):
-                        optimist_response = get_agent_response(optimist_chain, idea_full_context, transcript)
-                        st.markdown(optimist_response)
-                    transcript += f"\nRound {round_number} - Optimist: {optimist_response}"
+            for r in range(rounds):
+                st.markdown(f"### Round {r + 1}")
 
-                    st.divider()
-                    st.markdown("Critic's Turn:")
-                    with st.spinner("Critic is thinking..."):
-                        critic_response = get_agent_response(critic_chain, idea_full_context, transcript)
-                        st.markdown(critic_response)
-                    transcript += f"\nRound {round_number} - Critic: {critic_response}"
+                opt = agent_response(optimist_chain, idea_context, transcript, rag_context)
+                st.markdown("**Optimist:**")
+                st.markdown(opt)
+                transcript += f"\nOptimist: {opt}"
+
+                crit = agent_response(critic_chain, idea_context, transcript, rag_context)
+                st.markdown("**Critic:**")
+                st.markdown(crit)
+                transcript += f"\nCritic: {crit}"
 
             st.divider()
-            st.subheader("--- Final Business Analyst Summary ---")
-            with st.spinner("Drafting final summary..."):
-                final_summary = get_summary(idea_full_context, transcript)
-                st.markdown(final_summary)
+            final_summary = get_summary(idea_context, transcript, rag_context)
+            st.subheader("📌 Final Verdict")
+            st.markdown(final_summary)
 
+            debates_collection.insert_one({
+                "idea_title": st.session_state.idea_title,
+                "idea_description": st.session_state.idea_desc,
+                "clarifying_answers": st.session_state.answers,
+                "debate_transcript": transcript,
+                "final_summary": final_summary,
+                "created_at": datetime.datetime.utcnow()
+            })
+
+            st.success("Analysis saved successfully.")
+
+# --------------------------------------------------
+#  Page: History
+# --------------------------------------------------
+def show_history_page():
+    st.title("📚 Analysis Archive")
+
+    items = list(debates_collection.find().sort("created_at", DESCENDING))
+    if not items:
+        st.info("No saved analyses.")
+        return
+
+    for doc in items:
+        with st.expander(doc["idea_title"]):
+            st.markdown(doc["final_summary"])
+
+# --------------------------------------------------
+# Sidebar (DEFINED ONCE)
+# --------------------------------------------------
+with st.sidebar:
+    st.markdown("## 🚀 IdeaCritic")
+    st.caption("AI-Powered Startup Analysis")
+
+    # System Status Accordion
+    with st.expander("🔧 System Status", expanded=False):
+        st.markdown("### 🧠 LLM Backend")
+        st.success("Google Gemini active (langchain-google-genai)")
+
+        st.markdown("### 📚 RAG Store")
+        if HAS_RAG:
+            st.success("RAG store loaded · Marketplace data included")
+        else:
+            st.warning("RAG disabled")
+
+        st.markdown("### 💾 Storage")
+        try:
+            mongo_client.admin.command("ping")
+            st.success("MongoDB connected")
+        except Exception:
+            st.error("MongoDB not connected")
+
+    # Navigation
+    st.markdown("### 🧭 Navigation")
+    page = st.radio(
+        "Go to:",
+        ["New Analysis", "Analysis History"],
+        label_visibility="collapsed"
+    )
+
+    st.divider()
+
+    # Statistics
+    with st.expander("📊 Statistics", expanded=False):
+        try:
+            total = debates_collection.count_documents({})
+            st.metric("Total Analyses", total)
+            st.caption("💡 Each analysis includes AI debate + market insights")
+        except Exception:
+            st.metric("Total Analyses", "—")
+            st.caption("Database connection issue")
+
+    # Quick Actions
+    with st.expander("⚡ Quick Actions", expanded=False):
+        if st.button("🔄 Refresh RAG Data", help="Reload marketplace intelligence"):
             try:
-                doc = {
-                    "idea_title": st.session_state["idea_title"],
-                    "idea_description": st.session_state["idea_desc"],
-                    "clarifying_answers": st.session_state["answers"],
-                    "debate_transcript": transcript.strip(),
-                    "final_summary": final_summary,
-                    "created_at": datetime.datetime.now(datetime.timezone.utc)
-                }
-                result = debates_collection.insert_one(doc)
-                st.success(f"💾 Analysis saved! Document ID: {result.inserted_id}")
-            except Exception as e:
-                st.error(f"❌ Failed to save analysis: {e}")
-
-# --- Page 2: History Page ---
-def show_analysis_history_page(all_analyses):
-    if 'selected_debate_id' in st.session_state:
-        selected_id = st.session_state.selected_debate_id
-        selected_analysis = next((d for d in all_analyses if str(d['_id']) == selected_id), None)
-        if selected_analysis:
-            if st.button("⬅️ Back to Archive"):
-                del st.session_state.selected_debate_id
+                initialize_marketplace_data()
+                st.success("RAG data refreshed!")
                 st.rerun()
-            st.header(f"Viewing Analysis: {selected_analysis['idea_title']}")
-            st.caption(f"Analyzed on: {selected_analysis['created_at'].strftime('%B %d, %Y at %I:%M %p')}")
-            st.divider()
-            st.subheader("Final Summary")
-            st.markdown(selected_analysis['final_summary'])
-            st.subheader("Full Breakdown")
-            with st.expander("Original Idea"):
-                st.write(selected_analysis['idea_description'])
-            with st.expander("Clarifying Answers"):
-                st.write(selected_analysis.get('clarifying_answers', {}))
-            with st.expander("Transcript"):
-                st.text(selected_analysis['debate_transcript'])
-    else:
-        st.title("📚 Analysis Archive")
-        if not all_analyses:
-            st.warning("Archive is empty.")
-            return
-        st.subheader("All Saved Analyses")
-        for analysis in all_analyses:
-            with st.container():
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.markdown(f"##### {analysis['idea_title']}")
-                    st.caption(f"Created on: {analysis['created_at'].strftime('%B %d, %Y %I:%M %p')}")
-                with col2:
-                    if st.button("View Full Report", key=f"view_{analysis['_id']}"):
-                        st.session_state.selected_debate_id = str(analysis['_id'])
-                        st.rerun()
-                st.write(analysis.get('final_summary', '')[:200] + "...")
+            except Exception as e:
+                st.error(f"Refresh failed: {e}")
 
-# --- Sidebar Navigation ---
-st.sidebar.markdown("## 🚀 IdeaCritic (LangChain)")
-page_options = ["New Analysis", "Analysis History"]
+        if st.button("📊 View System Info", help="Show technical details"):
+            st.info(f"""
+            **Technical Details:**
+            - Python: 3.13
+            - Streamlit: 1.39.0
+            - LangChain: v1.x
+            - FAISS: Vector store
+            - MongoDB: Document storage
+            """)
 
-def on_page_change():
-    if st.session_state.radio_nav == "New Analysis":
-        for key in ["clarifying_questions", "idea_title", "idea_desc", "answers", "selected_debate_id"]:
-            if key in st.session_state:
-                del st.session_state[key]
 
-selected_page = st.sidebar.radio("Main Menu", page_options, key="radio_nav", on_change=on_page_change)
-st.sidebar.divider()
 
-try:
-    total_analyses = debates_collection.count_documents({})
-    st.sidebar.metric("Total Analyses", total_analyses)
-    st.sidebar.success("✅ MongoDB Connected")
-except Exception:
-    st.sidebar.error("DB connection error.")
-
-# --- Page Routing ---
-if selected_page == "New Analysis":
+if page == "New Analysis":
     show_new_analysis_page()
-elif selected_page == "Analysis History":
-    all_analyses = list(debates_collection.find().sort("created_at", DESCENDING))
-    show_analysis_history_page(all_analyses)
+else:
+    show_history_page()

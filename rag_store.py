@@ -1,11 +1,11 @@
 
-# rag_store.py
+
 import os
 import pickle
 import math
 from typing import List, Dict, Optional, Tuple
 
-# Lazy import so module can be imported on systems without faiss / sentence-transformers
+
 try:
     import faiss
     from sentence_transformers import SentenceTransformer
@@ -147,7 +147,7 @@ def index_from_db(collection, title_field="idea_title", desc_field="idea_descrip
         desc = doc.get(desc_field, "")
         transcript = doc.get(transcript_field, "")
         text = f"{title}\n\n{desc}\n\n{transcript}"
-        # simple whitespace chunker (keeps in sync with app chunking)
+       
         words = text.split()
         chunk_size = 300
         overlap = 50
@@ -165,7 +165,67 @@ def index_from_db(collection, title_field="idea_title", desc_field="idea_descrip
 
 
 # --- Scoring function for "startup idea score" using vector similarity signals ---
-def score_idea(title: str, desc: str, top_k: int = 8) -> Dict:
+def add_marketplace_data(marketplace_docs: List[Dict]) -> bool:
+    """
+    Add marketplace information to the RAG store.
+    Expected doc format: {
+        "text": "marketplace content",
+        "source": "app_store/play_store/etc",
+        "category": "product/app category",
+        "metadata": {...}
+    }
+    """
+    store = get_rag_store()
+    if store is None:
+        return False
+    
+    try:
+        # Add source indicator to distinguish marketplace data
+        processed_docs = []
+        for doc in marketplace_docs:
+            doc_copy = dict(doc)
+            doc_copy["text"] = f"[MARKETPLACE] {doc['text']}"
+            doc_copy["source_type"] = "marketplace"
+            processed_docs.append(doc_copy)
+        
+        store.add_documents(processed_docs)
+        store.save()
+        return True
+    except Exception:
+        return False
+
+
+def get_marketplace_context(query: str, top_k: int = 2) -> str:
+    """
+    Retrieve marketplace-specific context for a query.
+    """
+    store = get_rag_store()
+    if store is None or store.is_empty():
+        return ""
+    
+    try:
+        # Search for marketplace documents specifically
+        all_results = store.search(query, top_k=top_k * 2)  # Get more results to filter
+        
+        marketplace_results = [
+            result for result in all_results 
+            if result.get("source_type") == "marketplace"
+        ][:top_k]  # Limit to top_k marketplace results
+        
+        if not marketplace_results:
+            return ""
+        
+        context = "\n\n--- Marketplace Intelligence ---\n"
+        for i, result in enumerate(marketplace_results, 1):
+            context += f"{i}. {result.get('text', '').replace('[MARKETPLACE] ', '')}\n"
+            if 'source' in result:
+                context += f"   Source: {result['source']}\n"
+            if 'category' in result:
+                context += f"   Category: {result['category']}\n"
+            context += "\n"
+        return context
+    except Exception:
+        return ""
     """
     Returns a dict:
     {
