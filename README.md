@@ -1,4 +1,4 @@
-# IdeaCritic — LLM-Powered Idea Evaluation & Critique Engine
+# IdeaCritic 
 
 A structured, multi-stage evaluation system that uses LLM reasoning + RAG + schema-constrained workflows to critique ideas with consistency, depth, and zero hallucination drift.
 
